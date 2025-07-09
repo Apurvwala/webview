@@ -10,37 +10,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install system dependencies
+      - name: Install system packages
         run: |
           sudo apt update
           sudo apt install -y \
-            build-essential ccache libtool autoconf automake zip unzip \
-            openjdk-17-jdk python3-pip git ffmpeg \
-            libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev \
-            libportmidi-dev libswscale-dev libavformat-dev libavcodec-dev \
-            zlib1g-dev libmtdev-dev xclip libjpeg-dev libfreetype6-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            build-essential autoconf automake libtool zip unzip \
+            openjdk-17-jdk python3-pip git \
+            ffmpeg libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev \
+            libsdl2-ttf-dev libportmidi-dev libswscale-dev libavformat-dev \
+            libavcodec-dev zlib1g-dev libmtdev-dev xclip libjpeg-dev \
+            libfreetype6-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             pkg-config libffi-dev libssl-dev
 
-      - name: Install Python tools
+      - name: Install Python dependencies
         run: |
           pip install --upgrade pip
           pip install cython buildozer
 
-      - name: Install build-tools 33.0.2 + accept licenses
+      - name: Prepare Android SDK config
         run: |
           mkdir -p ~/.android && touch ~/.android/repositories.cfg
-          yes | sdkmanager --sdk_root=${ANDROID_SDK_ROOT} --licenses || true
-          sdkmanager "build-tools;33.0.2" "platform-tools" "platforms;android-33"
-
-      - name: Set build-tools version in buildozer.spec
-        run: |
-          sed -i 's/^# *android.api =.*/android.api = 33/' buildozer.spec
-          sed -i 's/^# *android.build_tools_version =.*/android.build_tools_version = 33.0.2/' buildozer.spec
-          sed -i 's/^# *android.minapi =.*/android.minapi = 21/' buildozer.spec
 
       - name: Build APK
         run: buildozer android debug
