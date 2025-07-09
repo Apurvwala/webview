@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android APK with Docker
 
 on:
   push:
@@ -6,37 +6,29 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-apk:
+  build:
     runs-on: ubuntu-latest
 
+    container:
+      image: kivy/buildozer:stable
+
     steps:
-      - name: Checkout source
+      - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Set up build cache
+        uses: actions/cache@v3
         with:
-          python-version: '3.10'
+          path: |
+            .buildozer
+            bin
+          key: ${{ runner.os }}-buildozer-${{ hashFiles('**/*.py') }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            ${{ runner.os }}-buildozer
 
-      - name: Install system dependencies and dev tools
+      - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y zip unzip openjdk-17-jdk python3-pip \
-            git build-essential ffmpeg libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev \
-            libsdl2-ttf-dev libportmidi-dev libswscale-dev libavformat-dev libavcodec-dev \
-            zlib1g-dev libmtdev-dev xclip libjpeg-dev libfreetype6-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            autoconf automake libtool pkg-config
-
-      - name: Install Python build tools
-        run: |
-          pip install --upgrade pip
-          pip install cython buildozer
-
-      - name: Pre-install SDK & accept licenses
-        run: |
-          mkdir -p $HOME/.android && touch $HOME/.android/repositories.cfg
-          yes | buildozer android update
+          pip install --upgrade cython
 
       - name: Build APK
         run: buildozer android debug
