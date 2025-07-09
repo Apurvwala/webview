@@ -16,23 +16,20 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt update
-          sudo apt install -y \
-            build-essential autoconf automake libtool zip unzip \
-            openjdk-17-jdk python3-pip git \
-            ffmpeg libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev \
-            libsdl2-ttf-dev libportmidi-dev libswscale-dev libavformat-dev \
-            libavcodec-dev zlib1g-dev libmtdev-dev xclip libjpeg-dev \
-            libfreetype6-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            pkg-config libffi-dev libssl-dev
+          sudo apt install -y build-essential autoconf automake libtool pkg-config \
+            libffi-dev libssl-dev openjdk-17-jdk python3-pip ffmpeg \
+            libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev \
+            libportmidi-dev libswscale-dev libavformat-dev libavcodec-dev \
+            zlib1g-dev libjpeg-dev libfreetype6-dev libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
 
-      - name: Install Python dependencies
+      - name: Install Python tools
         run: |
           pip install --upgrade pip
           pip install cython buildozer
 
-      - name: Prepare Android SDK config
-        run: |
-          mkdir -p ~/.android && touch ~/.android/repositories.cfg
+      - name: Setup Android license
+        run: mkdir -p ~/.android && touch ~/.android/repositories.cfg
 
       - name: Build APK
         run: buildozer android debug
