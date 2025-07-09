@@ -8,16 +8,21 @@ import time
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.image import MIMEImage # Import MIMEImage for attaching images
+from email.mime.image import MIMEImage
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
+import io # For handling image data in memory
 
-import cv2
 import numpy as np
 import requests
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import base64
+
+# Import the face_recognition library
+import face_recognition
+# Import Pillow for image manipulation (replaces OpenCV for general image tasks)
+from PIL import Image
 
 # --- Configuration Constants (from original Kivy app) ---
 SAMPLES_PER_USER: int = 10
@@ -25,7 +30,11 @@ FRAME_REDUCE_FACTOR: float = 0.5 # Not directly used for backend processing, but
 RECOGNITION_INTERVAL: int = 3 * 60 # 3 minutes
 AUDIO_FILE: str = "thank_you.mp3" # This will be handled by frontend
 TICK_ICON_PATH: str = "tick.png" # This will be handled by frontend
-HAAR_CASCADE_PATH: str = "app/haarcascade_frontalface_default.xml" # Ensure this path is correct relative to app.py
+# HAAR_CASCADE_PATH is no longer needed with face_recognition
+# HAAR_CASCADE_PATH: str = "./haarcascade_frontalface_default.xml" # Ensure this path is correct relative to app.py
+
+# Define a recognition threshold for face_recognition (lower is better, 0.6 is common)
+RECOGNITION_THRESHOLD: float = 0.6
 
 GOOGLE_FORM_VIEW_URL: str = (
     "https://docs.google.com/forms/u/0/d/e/1FAIpQLScO9FVgTOXCeuw210SK6qx2fXiouDqouy7TTuoI6UD80ZpYvQ/viewform"
@@ -57,27 +66,28 @@ def ensure_dir(path: str | Path) -> None:
 def python_time_now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def _crop_and_resize_for_passport(cv_image: np.ndarray, target_size: Tuple[int, int] = (240, 320)) -> np.ndarray:
+def _crop_and_resize_for_passport(pil_image: Image.Image, target_size: Tuple[int, int] = (240, 320)) -> Image.Image:
     """
-    Crops and resizes an image to a target aspect ratio and size,
+    Crops and resizes a PIL Image to a target aspect ratio and size,
     similar to passport photo requirements.
     """
-    h, w = cv_image.shape[:2]
+    w, h = pil_image.size
     target_width, target_height = target_size
     target_aspect_ratio = target_width / target_height
     current_aspect_ratio = w / h
 
-    cropped_image = cv_image
+    cropped_image = pil_image
     if current_aspect_ratio > target_aspect_ratio:
         new_width = int(h * target_aspect_ratio)
         x_start = (w - new_width) // 2
-        cropped_image = cv_image[:, x_start : x_start + new_width]
+        cropped_image = pil_image.crop((x_start, 0, x_start + new_width, h))
     elif current_aspect_ratio < target_aspect_ratio:
         new_height = int(w / target_aspect_ratio)
         y_start = (h - new_height) // 2
-        cropped_image = cv_image[y_start : y_start + new_height, :]
+        cropped_image = pil_image.crop((0, y_start, w, y_start + new_height))
 
-    resized_image = cv2.resize(cropped_image, target_size, interpolation=cv2.INTER_AREA)
+    # Use Image.LANCZOS for high-quality downsampling
+    resized_image = cropped_image.resize(target_size, Image.LANCZOS)
     return resized_image
 
 class FaceAppBackend:
@@ -86,25 +96,10 @@ class FaceAppBackend:
         ensure_dir(self.known_faces_dir)
         Logger(f"[INFO] Known faces directory set to: {self.known_faces_dir}")
 
-        self.face_cascade = cv2.CascadeClassifier(HAAR_CASCADE_PATH)
-        if self.face_cascade.empty():
-            Logger(f"[WARN] Failed to load Haar cascade from '{HAAR_CASCADE_PATH}'. Attempting fallback to OpenCV data path.")
-            fallback_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            self.face_cascade = cv2.CascadeClassifier(fallback_path)
-            if self.face_cascade.empty():
-                error_msg = (f"[ERROR] Failed to load Haar cascade classifier from both "
-                             f"'{HAAR_CASCADE_PATH}' and '{fallback_path}'. "
-                             f"Please ensure 'haarcascade_frontalface_default.xml' is present and accessible "
-                             f"in your project folder.")
-                Logger(error_msg)
-                raise RuntimeError(error_msg)
-            else:
-                Logger(f"[INFO] Successfully loaded Haar cascade from fallback path: '{fallback_path}'.")
-        else:
-            Logger(f"[INFO] Successfully loaded Haar cascade from: '{HAAR_CASCADE_PATH}'.")
+        # Store known face encodings and their corresponding IDs
+        self.known_face_encodings: List[np.ndarray] = []
+        self.known_face_ids: List[Tuple[str, str]] = [] # Stores (name, emp_id) for each encoding
 
-        self.recognizer = None
-        self.label_map = {}
         self.last_seen_time: Dict[str, float] = {}
         self.otp_storage: Dict[str, str] = {}
         self.pending_names: Dict[str, Optional[str]] = {} # Stores name for capture process
@@ -120,24 +115,17 @@ class FaceAppBackend:
         self.capture_start_index: int = 0
         self.capture_lock = threading.Lock() # To prevent race conditions during capture
 
-        self._train_recognizer_and_load_emails() # Initial training and email loading
+        self._load_known_faces_and_emails() # Initial loading and encoding
         self.daily_attendance_status = self._load_daily_attendance_status() # Load attendance status
 
-    def _train_recognizer_and_load_emails(self):
-        """Initializes recognizer and loads user emails."""
-        self.recognizer, self.label_map = self._train_recognizer()
-        self.user_emails = self._load_emails()
-
-    def _train_recognizer(self):
+    def _load_known_faces_and_emails(self):
         """
-        Trains the LBPHFaceRecognizer with images found in known_faces_dir.
-        Returns the trained recognizer and a label map.
+        Loads images from known_faces_dir, computes face encodings,
+        and loads user emails.
         """
-        images: list[np.ndarray] = []
-        labels: list[int] = []
-        label_map: Dict[int, Tuple[str, str]] = {}
-        label_id = 0
-
+        self.known_face_encodings = []
+        self.known_face_ids = []
+        
         ensure_dir(self.known_faces_dir)
         for file in sorted(os.listdir(self.known_faces_dir)):
             if not file.lower().endswith((".jpg", ".png")):
@@ -148,49 +136,34 @@ class FaceAppBackend:
                 if len(parts) < 3:
                     Logger(f"[WARN] Skipping unrecognised filename format: {file}")
                     continue
-                name = "_".join(parts[:-2]).lower() # Reconstruct name if it had underscores
+                # Reconstruct name if it had underscores, then convert to lowercase
+                name = "_".join(parts[:-2]).lower()
                 emp_id = parts[-2].upper()
             except ValueError:
                 Logger(f"[WARN] Skipping unrecognised filename format: {file}")
                 continue
 
             img_path = Path(self.known_faces_dir) / file
-            img_gray = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
-            if img_gray is None:
-                Logger(f"[WARN] Could not read image: {img_path}")
-                continue
-
-            img_resized = cv2.resize(img_gray, (200, 200)) # Standardize size for training
-            images.append(img_resized)
-
-            # Assign a unique label_id for each unique (name, emp_id) pair
-            current_identity = (name, emp_id)
-            if current_identity not in label_map.values():
-                label_map[label_id] = current_identity
-                labels.append(label_id)
-                label_id += 1
-            else:
-                # Find existing label_id for this identity
-                existing_label_id = -1
-                for lbl, identity in label_map.items():
-                    if identity == current_identity:
-                        existing_label_id = lbl
-                        break
-                labels.append(existing_label_id)
-
-        recogniser = cv2.face.LBPHFaceRecognizer_create()
-        if images:
             try:
-                recogniser.train(images, np.array(labels))
-                Logger(f"[INFO] Trained recogniser on {len(images)} images across {len(label_map)} identities.")
-            except cv2.error as e:
-                Logger(f"[ERROR] OpenCV training error: {e}. This might happen if there's only one sample or all samples are identical.")
-                recogniser = None # Mark as untrained
-        else:
-            Logger("[INFO] No images found – recogniser disabled until first registration.")
-            recogniser = None # Mark as untrained
+                # face_recognition.load_image_file uses PIL internally, so it's fine
+                img = face_recognition.load_image_file(str(img_path))
+                # Find all face locations and encodings in the image
+                face_locations = face_recognition.face_locations(img)
+                face_encodings = face_recognition.face_encodings(img, face_locations)
 
-        return recogniser, label_map
+                if face_encodings:
+                    # Assuming one primary face per training image
+                    self.known_face_encodings.append(face_encodings[0])
+                    self.known_face_ids.append((name, emp_id))
+                    Logger(f"[INFO] Loaded encoding for {name.title()} ({emp_id}) from {file}")
+                else:
+                    Logger(f"[WARN] No face found in training image: {file}")
+            except Exception as e:
+                Logger(f"[ERROR] Could not load or process image {img_path}: {e}")
+                continue
+        
+        Logger(f"[INFO] Loaded {len(self.known_face_encodings)} known face encodings for {len(set(self.known_face_ids))} unique identities.")
+        self.user_emails = self._load_emails()
 
     def _load_emails(self) -> Dict[str, str]:
         """Loads user emails from a JSON file."""
@@ -370,113 +343,104 @@ class FaceAppBackend:
 
     def process_frame(self, frame_data_b64: str) -> Dict[str, Any]:
         """
-        Processes a single frame for face detection and recognition.
+        Processes a single frame for face detection and recognition using face_recognition.
         If in capture mode, it saves face samples.
         Returns detection/recognition results.
         """
         try:
-            # Decode base64 image
-            nparr = np.frombuffer(base64.b64decode(frame_data_b64), np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            # Decode base64 image using PIL
+            image_bytes = base64.b64decode(frame_data_b64)
+            # Use BytesIO to treat bytes as a file for Image.open
+            pil_image = Image.open(io.BytesIO(image_bytes))
 
-            if frame is None:
-                Logger("[ERROR] Could not decode image data.")
+            if pil_image is None:
+                Logger("[ERROR] Could not decode image data using PIL.")
                 return {"status": "error", "message": "Invalid image data"}
 
-            h, w = frame.shape[:2]
-            # Reduce frame size for faster processing, similar to Kivy app's FRAME_REDUCE_FACTOR
-            # This is applied here as the frontend might send full resolution frames.
-            # If frontend already resizes, this can be removed or adjusted.
-            resized = cv2.resize(
-                frame, (int(w * 0.5), int(h * 0.5))
-            )
-            gray_small = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            # Ensure image is in RGB format for face_recognition
+            if pil_image.mode != 'RGB':
+                pil_image = pil_image.convert('RGB')
+            
+            # Convert PIL image to a NumPy array for face_recognition
+            # face_recognition expects a NumPy array (height, width, channels)
+            frame_np = np.array(pil_image)
 
-            try:
-                faces = self.face_cascade.detectMultiScale(gray_small, scaleFactor=1.1, minNeighbors=5)
-            except cv2.error as e:
-                Logger(f"[ERROR] OpenCV error in detectMultiScale: {e}")
-                faces = []
+            # Find all the faces and face encodings in the current frame
+            face_locations = face_recognition.face_locations(frame_np)
+            face_encodings = face_recognition.face_encodings(frame_np, face_locations)
 
             results = []
-            for (x, y, w_s, h_s) in faces:
-                # Scale back to original frame coordinates
-                x_full, y_full, w_full, h_full = [
-                    int(v / 0.5) for v in (x, y, w_s, h_s)
-                ]
-
-                # Extract face ROI from original frame for better quality recognition/storage
-                expansion_factor = 1.8
-                exp_w = int(w_full * expansion_factor)
-                exp_h = int(h_full * expansion_factor)
-                center_x = x_full + w_full // 2
-                center_y = y_full + h_full // 2
-                exp_x = center_x - exp_w // 2
-                exp_y = center_y - exp_h // 2
-
-                frame_h, frame_w = frame.shape[:2]
-                exp_x = max(0, min(exp_x, frame_w - exp_w))
-                exp_y = max(0, min(exp_y, frame_h - exp_h))
-                exp_w = min(exp_w, frame_w - exp_x)
-                exp_h = min(exp_h, frame_h - exp_y)
-
-                # Ensure valid ROI dimensions before slicing
-                if exp_w <= 0 or exp_h <= 0:
-                    Logger(f"[WARN] Invalid face ROI dimensions: w={exp_w}, h={exp_h}. Skipping.")
-                    continue
-
-                color_face_roi = frame[exp_y : exp_y + exp_h, exp_x : exp_x + exp_w].copy()
-                grayscale_face_roi = cv2.cvtColor(color_face_roi, cv2.COLOR_BGR2GRAY)
+            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+                # The 'box' coordinates are (top, right, bottom, left) from face_recognition.
+                # Convert to (x, y, w, h) for consistency with previous output format.
+                x_full, y_full, w_full, h_full = left, top, right - left, bottom - top
 
                 name = "unknown"
                 emp_id = ""
-                conf = 1000 # High confidence for unknown
+                conf = 1.0 # High distance for unknown (1.0 means no match)
 
-                if self.recognizer:
-                    try:
-                        label, conf = self.recognizer.predict(grayscale_face_roi)
-                        name, emp_id = self.label_map.get(label, ("unknown", ""))
-                    except Exception as e:
-                        Logger(f"[ERROR] Recognizer prediction failed: {e}")
-                        label, conf = -1, 1000 # Reset to unknown on error
+                if self.known_face_encodings: # Only attempt recognition if known faces exist
+                    # Compare current face with known faces
+                    face_distances = face_recognition.face_distance(self.known_face_encodings, face_encoding)
+                    best_match_index = np.argmin(face_distances)
+
+                    # Check if the best match is within the recognition threshold
+                    if face_distances[best_match_index] < RECOGNITION_THRESHOLD:
+                        name, emp_id = self.known_face_ids[best_match_index]
+                        conf = face_distances[best_match_index] # Store distance as confidence (lower is better)
+                        Logger(f"[INFO] Recognized: {name.title()} ({emp_id}) with distance: {conf:.2f}")
+                    else:
+                        Logger(f"[INFO] Face detected, but not recognized (min distance: {face_distances[best_match_index]:.2f}).")
+                else:
+                    Logger("[INFO] No known faces for recognition.")
+
 
                 face_info = {
                     "box": [x_full, y_full, w_full, h_full],
                     "name": name.title(),
                     "emp_id": emp_id,
-                    "confidence": float(conf),
+                    "confidence": float(conf), # Using distance as 'confidence' (lower is better)
                     "status": "unknown"
                 }
 
                 if self.capture_mode:
                     with self.capture_lock:
                         if self.capture_collected_count < self.capture_target_count:
-                            face_img_resized = cv2.resize(grayscale_face_roi, (200, 200))
+                            # Extract face ROI from original PIL image for saving
+                            # PIL crop uses (left, upper, right, lower)
+                            face_roi_pil = pil_image.crop((left, top, right, bottom))
+                            
+                            # Resize for consistency in saved samples
+                            # Use Image.LANCZOS for high-quality downsampling
+                            face_img_resized_pil = face_roi_pil.resize((200, 200), Image.LANCZOS)
                             filename = f"{self.capture_name}_{self.capture_emp_id}_{self.capture_start_index + self.capture_collected_count:03d}.jpg"
-                            cv2.imwrite(str(Path(self.known_faces_dir) / filename), face_img_resized)
+                            face_img_resized_pil.save(str(Path(self.known_faces_dir) / filename))
                             self.capture_collected_count += 1
                             Logger(f"[INFO] Captured sample {self.capture_collected_count}/{self.capture_target_count} for {self.capture_emp_id}")
                             face_info["capture_progress"] = f"{self.capture_collected_count}/{self.capture_target_count}"
                             face_info["status"] = "capturing"
                             if self.capture_collected_count >= self.capture_target_count:
-                                Logger("[INFO] Capture complete – retraining recogniser…")
+                                Logger("[INFO] Capture complete – reloading known faces…")
                                 self.capture_mode = False # End capture mode
-                                # Retrain recognizer in a separate thread to avoid blocking
-                                threading.Thread(target=self._retrain_after_capture, daemon=True).start()
+                                # Reload known faces in a separate thread to avoid blocking
+                                threading.Thread(target=self._reload_known_faces_after_capture, daemon=True).start()
                                 face_info["status"] = "capture_complete"
                         else:
-                            face_info["status"] = "capturing" # Still in capture mode until retraining is done
+                            face_info["status"] = "capturing" # Still in capture mode until reloading is done
                 else: # Normal recognition mode
-                    if conf < 60: # Threshold for known face
+                    # Use RECOGNITION_THRESHOLD for face_recognition distance
+                    if conf < RECOGNITION_THRESHOLD: # Lower distance means better match
                         now = time.time()
                         last_seen = self.last_seen_time.get(emp_id, 0)
                         if now - last_seen > RECOGNITION_INTERVAL:
                             self.last_seen_time[emp_id] = now
                             face_info["status"] = "recognized_new"
+                            # Extract the detected face ROI for the email/preview
+                            face_roi_pil_for_email = pil_image.crop((left, top, right, bottom))
                             # Trigger attendance submission and preview update in separate threads
                             threading.Thread(
                                 target=self._handle_successful_recognition,
-                                args=(name, emp_id, color_face_roi),
+                                args=(name, emp_id, face_roi_pil_for_email), # Pass PIL image
                                 daemon=True,
                                 name="AttendanceSubmitter",
                             ).start()
@@ -493,13 +457,13 @@ class FaceAppBackend:
             Logger(f"[ERROR] Error processing frame: {e}")
             return {"status": "error", "message": str(e)}
 
-    def _retrain_after_capture(self):
-        """Retrains the recognizer after samples are captured."""
-        self.recognizer, self.label_map = self._train_recognizer()
-        Logger("[INFO] Recognizer retraining finished.")
+    def _reload_known_faces_after_capture(self):
+        """Reloads known faces and their encodings after new samples are captured."""
+        self._load_known_faces_and_emails()
+        Logger("[INFO] Known faces reloading finished.")
 
 
-    def _handle_successful_recognition(self, name: str, emp_id: str, face_roi_color: np.ndarray):
+    def _handle_successful_recognition(self, name: str, emp_id: str, face_roi_pil: Image.Image):
         """Handles post-recognition actions like attendance submission and email sending."""
         Logger(f"[INFO] Recognised {name} ({emp_id}) – submitting attendance and checking email status…")
         
@@ -509,9 +473,12 @@ class FaceAppBackend:
         user_email = self.user_emails.get(emp_id)
 
         # Process face image for display on frontend and for email
-        processed_face_image = _crop_and_resize_for_passport(face_roi_color, (240, 320))
-        _, buffer = cv2.imencode('.jpg', processed_face_image)
-        face_image_b64 = base64.b64encode(buffer).decode('utf-8')
+        processed_face_image_pil = _crop_and_resize_for_passport(face_roi_pil, (240, 320))
+        
+        # Convert PIL image to base64
+        buffered = io.BytesIO()
+        processed_face_image_pil.save(buffered, format="JPEG") # Save as JPEG
+        face_image_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
         if user_email:
             # Check if this is the first recognition for today for this user
@@ -562,7 +529,8 @@ class FaceAppBackend:
             # If updating, ensure the name is retrieved from existing data if not provided
             resolved_name = name
             if updating and not resolved_name:
-                resolved_name = next((nm for _lbl, (nm, eid) in self.label_map.items() if eid == emp_id), None)
+                # Find the name from known_face_ids based on emp_id
+                resolved_name = next((nm for nm, eid in self.known_face_ids if eid == emp_id), None)
                 if resolved_name is None:
                     return {"status": "error", "message": "No existing face found for this ID – please register first or provide a name."}
             elif not resolved_name: # For new registration, name is mandatory
@@ -594,12 +562,13 @@ class FaceAppBackend:
     def get_user_email(self, emp_id: str) -> Dict[str, Any]:
         """Retrieves email for a given employee ID."""
         email = self.user_emails.get(emp_id)
-        name = next((nm for _lbl, (nm, eid) in self.label_map.items() if eid == emp_id), None)
+        # Find the name from known_face_ids based on emp_id
+        name = next((nm for nm, eid in self.known_face_ids if eid == emp_id), None)
         return {"status": "success", "email": email, "name": name}
 
     def send_otp_flow(self, emp_id: str, email: str, name: Optional[str] = None) -> Dict[str, Any]:
         """Initiates the OTP sending process."""
-        resolved_name = name or next((nm for _lbl, (nm, eid) in self.label_map.items() if eid == emp_id), "Unknown User")
+        resolved_name = name or next((nm for nm, eid in self.known_face_ids if eid == emp_id), "Unknown User")
         otp = self._generate_otp()
         self.otp_storage[emp_id] = otp
         self.pending_names[emp_id] = resolved_name # Store name for later capture
@@ -728,14 +697,11 @@ def get_last_recognized_endpoint():
 
 if __name__ == '__main__':
     # To run this:
-    # 1. pip install Flask opencv-python numpy requests
-    # 2. Download haarcascade_frontalface_default.xml and place it in the same directory as app.py
-    #    (You can find it in OpenCV's data directory, e.g., site-packages/cv2/data/)
-    # 3. Set environment variables: FACEAPP_EMAIL, FACEAPP_PASS, FACEAPP_ADMIN_EMAIL
+    # 1. pip install Flask numpy requests face_recognition Pillow
+    # 2. Set environment variables: FACEAPP_EMAIL, FACEAPP_PASS, FACEAPP_ADMIN_EMAIL
     #    Example (Linux/macOS):
     #    export FACEAPP_EMAIL="your_email@gmail.com"
     #    export FACEAPP_PASS="your_app_password" # Use app password for Gmail, not your main password
     #    export FACEAPP_ADMIN_EMAIL="admin_email@example.com"
-    # 4. python app.py
+    # 3. python app.py
     app.run(host='0.0.0.0', port=5000, debug=True)
-
