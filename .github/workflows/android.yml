@@ -27,10 +27,16 @@ jobs:
             zlib1g-dev libmtdev-dev xclip libjpeg-dev libfreetype6-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
-      - name: Install Python build dependencies
+      - name: Install Python tools
         run: |
           pip install --upgrade pip
           pip install cython buildozer
+
+      - name: Accept Android SDK licenses manually
+        run: |
+          yes | sdkmanager --licenses || true
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
 
       - name: Build APK with Buildozer
         run: buildozer android debug
