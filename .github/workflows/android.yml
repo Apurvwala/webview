@@ -13,7 +13,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Set up Buildozer environment
+      - name: Install system dependencies
         run: |
           sudo apt update
           sudo apt install -y \
@@ -51,10 +51,9 @@ jobs:
           pip install --upgrade pip
           pip install cython buildozer
 
-      - name: Accept SDK licenses and prepare
+      - name: Set up Android SDK placeholder
         run: |
           mkdir -p ~/.android && touch ~/.android/repositories.cfg
-          yes | buildozer android update
 
       - name: Build APK
         run: |
