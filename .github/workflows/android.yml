@@ -32,13 +32,13 @@ jobs:
           pip install --upgrade pip
           pip install cython buildozer
 
-      - name: Accept Android SDK licenses manually
+      - name: Pre-install Android SDK tools manually
         run: |
-          yes | sdkmanager --licenses || true
-        env:
-          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          mkdir -p $HOME/.android && touch $HOME/.android/repositories.cfg
+          yes | sudo sdkmanager --licenses || true
+          yes | buildozer android update
 
-      - name: Build APK with Buildozer
+      - name: Build APK
         run: buildozer android debug
 
       - name: Upload APK artifact
