@@ -24,8 +24,8 @@ jobs:
           sudo apt install -y zip unzip openjdk-17-jdk python3-pip \
             git build-essential ffmpeg libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev \
             libsdl2-ttf-dev libportmidi-dev libswscale-dev libavformat-dev libavcodec-dev \
-            zlib1g-dev libgstreamer1.0 libgstreamer1.0-dev libmtdev-dev xclip libjpeg-dev \
-            libfreetype6-dev
+            zlib1g-dev libmtdev-dev xclip libjpeg-dev libfreetype6-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
       - name: Install Buildozer
         run: |
